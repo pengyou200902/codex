@@ -1,4 +1,5 @@
 use crate::agent::AgentStatus;
+use crate::agent::agent_status_from_event;
 use crate::agent::registry::AgentMetadata;
 use crate::agent::registry::AgentRegistry;
 use crate::agent::role::DEFAULT_ROLE_NAME;
@@ -317,8 +318,7 @@ impl AgentControl {
         )
         .await;
 
-        self.send_input(new_thread.thread_id, initial_operation)
-            .await?;
+        Box::pin(self.send_input(new_thread.thread_id, initial_operation)).await?;
         if !new_thread.thread.enabled(Feature::MultiAgentV2) {
             let child_reference = agent_metadata
                 .agent_path
@@ -332,6 +332,7 @@ impl AgentControl {
                 agent_metadata.agent_path.clone(),
             );
         }
+        self.start_spawn_slot_release_watcher(new_thread.thread_id);
 
         Ok(LiveAgent {
             thread_id: new_thread.thread_id,
@@ -586,6 +587,7 @@ impl AgentControl {
             .history
             .ok_or_else(|| CodexErr::ThreadNotFound(thread_id))?
             .items;
+        let restored_status = latest_agent_status_from_history(&history);
 
         let resumed_thread = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
@@ -604,6 +606,10 @@ impl AgentControl {
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
         reservation.commit(agent_metadata.clone());
+        let restored_status_is_final = restored_status.as_ref().is_some_and(is_final);
+        if restored_status_is_final {
+            self.state.release_spawn_slot(resumed_thread.thread_id);
+        }
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
         state.notify_thread_created(resumed_thread.thread_id);
@@ -619,6 +625,9 @@ impl AgentControl {
                 child_reference,
                 agent_metadata.agent_path.clone(),
             );
+        }
+        if !restored_status_is_final {
+            self.start_spawn_slot_release_watcher(resumed_thread.thread_id);
         }
         self.persist_thread_spawn_edge_for_source(
             resumed_thread.thread.as_ref(),
@@ -638,6 +647,7 @@ impl AgentControl {
     ) -> CodexResult<String> {
         let last_task_message = render_input_preview(&initial_operation);
         let state = self.upgrade()?;
+        let reacquired_slot = Box::pin(self.reserve_slot_if_needed(agent_id)).await?;
         let result = self
             .handle_thread_request_result(
                 agent_id,
@@ -648,6 +658,11 @@ impl AgentControl {
         if result.is_ok() {
             self.state
                 .update_last_task_message(agent_id, last_task_message);
+            if reacquired_slot {
+                self.start_spawn_slot_release_watcher(agent_id);
+            }
+        } else if reacquired_slot {
+            self.state.release_spawn_slot(agent_id);
         }
         result
     }
@@ -675,6 +690,7 @@ impl AgentControl {
     ) -> CodexResult<String> {
         let last_task_message = communication.content.clone();
         let state = self.upgrade()?;
+        let reacquired_slot = Box::pin(self.reserve_slot_if_needed(agent_id)).await?;
         let result = self
             .handle_thread_request_result(
                 agent_id,
@@ -687,6 +703,11 @@ impl AgentControl {
         if result.is_ok() {
             self.state
                 .update_last_task_message(agent_id, last_task_message);
+            if reacquired_slot {
+                self.start_spawn_slot_release_watcher(agent_id);
+            }
+        } else if reacquired_slot {
+            self.state.release_spawn_slot(agent_id);
         }
         result
     }
@@ -695,6 +716,14 @@ impl AgentControl {
     pub(crate) async fn interrupt_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.upgrade()?;
         state.send_op(agent_id, Op::Interrupt).await
+    }
+
+    async fn reserve_slot_if_needed(&self, agent_id: ThreadId) -> CodexResult<bool> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        let config = thread.codex.session.get_config().await;
+        self.state
+            .reserve_existing_spawn_slot(agent_id, config.agent_max_threads)
     }
 
     async fn handle_thread_request_result(
@@ -1015,6 +1044,29 @@ impl AgentControl {
         });
     }
 
+    fn start_spawn_slot_release_watcher(&self, thread_id: ThreadId) {
+        let control = self.clone();
+        tokio::spawn(async move {
+            let status = match control.subscribe_status(thread_id).await {
+                Ok(mut status_rx) => {
+                    let mut status = status_rx.borrow().clone();
+                    while !is_final(&status) {
+                        if status_rx.changed().await.is_err() {
+                            status = control.get_status(thread_id).await;
+                            break;
+                        }
+                        status = status_rx.borrow().clone();
+                    }
+                    status
+                }
+                Err(_) => control.get_status(thread_id).await,
+            };
+            if is_final(&status) {
+                control.state.release_spawn_slot(thread_id);
+            }
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_thread_spawn(
         &self,
@@ -1226,6 +1278,16 @@ fn agent_matches_prefix(agent_path: Option<&AgentPath>, prefix: &AgentPath) -> b
                 .strip_prefix(prefix.as_str())
                 .is_some_and(|suffix| suffix.starts_with('/'))
     })
+}
+
+fn latest_agent_status_from_history(history: &[RolloutItem]) -> Option<AgentStatus> {
+    history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(msg) => agent_status_from_event(msg),
+            _ => None,
+        })
+        .next_back()
 }
 
 pub(crate) fn render_input_preview(initial_operation: &Op) -> String {

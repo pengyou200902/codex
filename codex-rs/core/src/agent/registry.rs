@@ -28,6 +28,7 @@ pub(crate) struct AgentRegistry {
 #[derive(Default)]
 struct ActiveAgents {
     agent_tree: HashMap<String, AgentMetadata>,
+    counted_agent_ids: HashSet<ThreadId>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
 }
@@ -97,7 +98,7 @@ impl AgentRegistry {
     }
 
     pub(crate) fn release_spawned_thread(&self, thread_id: ThreadId) {
-        let removed_counted_agent = {
+        let should_release_slot = {
             let mut active_agents = self
                 .active_agents
                 .lock()
@@ -107,15 +108,58 @@ impl AgentRegistry {
                 .iter()
                 .find_map(|(key, metadata)| (metadata.agent_id == Some(thread_id)).then_some(key))
                 .cloned();
-            removed_key
-                .and_then(|key| active_agents.agent_tree.remove(key.as_str()))
-                .is_some_and(|metadata| {
-                    !metadata.agent_path.as_ref().is_some_and(AgentPath::is_root)
-                })
+            if let Some(key) = removed_key {
+                active_agents.agent_tree.remove(key.as_str());
+            }
+            active_agents.counted_agent_ids.remove(&thread_id)
         };
-        if removed_counted_agent {
+        if should_release_slot {
             self.total_count.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+
+    pub(crate) fn release_spawn_slot(&self, thread_id: ThreadId) {
+        let should_release_slot = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counted_agent_ids
+            .remove(&thread_id);
+        if should_release_slot {
+            self.total_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    pub(crate) fn reserve_existing_spawn_slot(
+        &self,
+        thread_id: ThreadId,
+        max_threads: Option<usize>,
+    ) -> Result<bool> {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active_agents.counted_agent_ids.contains(&thread_id) {
+            return Ok(false);
+        }
+        let should_reserve_slot = active_agents.agent_tree.values().any(|metadata| {
+            metadata.agent_id == Some(thread_id)
+                && !metadata.agent_path.as_ref().is_some_and(AgentPath::is_root)
+        });
+        if !should_reserve_slot {
+            return Ok(false);
+        }
+
+        if let Some(max_threads) = max_threads {
+            if !self.try_increment_spawned(max_threads) {
+                return Err(CodexErr::AgentLimitReached { max_threads });
+            }
+        } else {
+            self.total_count.fetch_add(1, Ordering::AcqRel);
+        }
+
+        active_agents.counted_agent_ids.insert(thread_id);
+        Ok(true)
     }
 
     pub(crate) fn register_root_thread(&self, thread_id: ThreadId) {
@@ -195,6 +239,13 @@ impl AgentRegistry {
             .unwrap_or_else(|| format!("thread:{thread_id}"));
         if let Some(agent_nickname) = agent_metadata.agent_nickname.clone() {
             active_agents.used_agent_nicknames.insert(agent_nickname);
+        }
+        if !agent_metadata
+            .agent_path
+            .as_ref()
+            .is_some_and(AgentPath::is_root)
+        {
+            active_agents.counted_agent_ids.insert(thread_id);
         }
         active_agents.agent_tree.insert(key, agent_metadata);
     }
