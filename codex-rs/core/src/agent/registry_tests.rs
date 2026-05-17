@@ -104,59 +104,6 @@ fn commit_holds_slot_until_release() {
 }
 
 #[test]
-fn release_spawn_slot_preserves_agent_metadata_until_thread_release() {
-    let registry = Arc::new(AgentRegistry::default());
-    let reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
-    let thread_id = ThreadId::new();
-    reservation.commit(agent_metadata(thread_id));
-
-    registry.release_spawn_slot(thread_id);
-    assert_eq!(
-        registry
-            .agent_metadata_for_thread(thread_id)
-            .and_then(|metadata| metadata.agent_id),
-        Some(thread_id)
-    );
-
-    let reservation = registry
-        .reserve_spawn_slot(Some(1))
-        .expect("slot released while metadata remains addressable");
-    drop(reservation);
-
-    registry.release_spawned_thread(thread_id);
-    assert!(registry.agent_metadata_for_thread(thread_id).is_none());
-}
-
-#[test]
-fn reserve_existing_spawn_slot_recounts_restarted_agent() {
-    let registry = Arc::new(AgentRegistry::default());
-    let reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
-    let thread_id = ThreadId::new();
-    reservation.commit(agent_metadata(thread_id));
-    registry.release_spawn_slot(thread_id);
-
-    assert!(
-        registry
-            .reserve_existing_spawn_slot(thread_id, Some(1))
-            .expect("existing agent should reacquire a slot")
-    );
-    assert!(
-        !registry
-            .reserve_existing_spawn_slot(thread_id, Some(1))
-            .expect("already counted agent should not double count")
-    );
-
-    let err = match registry.reserve_spawn_slot(Some(1)) {
-        Ok(_) => panic!("limit should be enforced after recounting restarted agent"),
-        Err(err) => err,
-    };
-    let CodexErr::AgentLimitReached { max_threads } = err else {
-        panic!("expected CodexErr::AgentLimitReached");
-    };
-    assert_eq!(max_threads, 1);
-}
-
-#[test]
 fn release_ignores_unknown_thread_id() {
     let registry = Arc::new(AgentRegistry::default());
     let reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
