@@ -442,10 +442,10 @@ impl Codex {
         if let Some(trace) = parent_trace.as_ref() {
             let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
         }
-        Self::spawn_internal(CodexSpawnArgs {
+        Box::pin(Self::spawn_internal(CodexSpawnArgs {
             parent_trace,
             ..args
-        })
+        }))
         .instrument(thread_spawn_span)
         .await
     }
@@ -1739,6 +1739,11 @@ impl Session {
     async fn deliver_event_raw(&self, event: Event) {
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
+            if is_final(&status) {
+                self.services
+                    .agent_control
+                    .release_spawn_slot(self.conversation_id);
+            }
             self.agent_status.send_replace(status);
         }
         if let Err(e) = self.tx_event.send(event).await {

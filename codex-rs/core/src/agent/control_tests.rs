@@ -239,6 +239,24 @@ async fn wait_for_live_thread_spawn_children(
     .expect("expected persisted child tree");
 }
 
+async fn complete_turn(thread: &Arc<CodexThread>, last_agent_message: &str) {
+    let turn = thread.codex.session.new_default_turn().await;
+    thread
+        .codex
+        .session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn.sub_id.clone(),
+                last_agent_message: Some(last_agent_message.to_string()),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+}
+
 #[tokio::test]
 async fn send_input_errors_when_manager_dropped() {
     let control = AgentControl::default();
@@ -1035,6 +1053,191 @@ async fn spawn_agent_releases_slot_after_shutdown() {
         .shutdown_live_agent(second_agent_id)
         .await
         .expect("shutdown agent");
+}
+
+#[tokio::test]
+async fn spawn_agent_releases_slot_after_turn_complete() {
+    let max_threads = 1usize;
+    let (_home, config) = test_config_with_cli_overrides(vec![(
+        "agents.max_threads".to_string(),
+        TomlValue::Integer(max_threads as i64),
+    )])
+    .await;
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let control = manager.agent_control();
+
+    let first_agent_id = control
+        .spawn_agent(
+            config.clone(),
+            text_input("hello"),
+            /*session_source*/ None,
+        )
+        .await
+        .expect("spawn_agent should succeed");
+    let first_thread = manager
+        .get_thread(first_agent_id)
+        .await
+        .expect("first agent should exist");
+    complete_turn(&first_thread, "done").await;
+
+    let second_agent_id = control
+        .spawn_agent(
+            config.clone(),
+            text_input("hello again"),
+            /*session_source*/ None,
+        )
+        .await
+        .expect("spawn_agent should succeed after first agent completes");
+
+    let _ = control
+        .shutdown_live_agent(first_agent_id)
+        .await
+        .expect("shutdown first agent");
+    let _ = control
+        .shutdown_live_agent(second_agent_id)
+        .await
+        .expect("shutdown second agent");
+}
+
+#[tokio::test]
+async fn send_input_to_completed_agent_reacquires_slot() {
+    let max_threads = 1usize;
+    let (_home, config) = test_config_with_cli_overrides(vec![(
+        "agents.max_threads".to_string(),
+        TomlValue::Integer(max_threads as i64),
+    )])
+    .await;
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let control = manager.agent_control();
+
+    let agent_id = control
+        .spawn_agent(
+            config.clone(),
+            text_input("hello"),
+            /*session_source*/ None,
+        )
+        .await
+        .expect("spawn_agent should succeed");
+    let thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("agent should exist");
+    complete_turn(&thread, "done").await;
+
+    let _ = control
+        .send_input(agent_id, text_input("new work"))
+        .await
+        .expect("send_input should reacquire the completed agent slot");
+    let err = control
+        .spawn_agent(
+            config.clone(),
+            text_input("blocked"),
+            /*session_source*/ None,
+        )
+        .await
+        .expect_err("reacquired slot should count toward the max thread limit");
+    let CodexErr::AgentLimitReached {
+        max_threads: seen_max_threads,
+    } = err
+    else {
+        panic!("expected CodexErr::AgentLimitReached");
+    };
+    assert_eq!(seen_max_threads, max_threads);
+
+    let _ = control
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown agent");
+}
+
+#[tokio::test]
+async fn queued_inter_agent_message_to_completed_agent_does_not_reacquire_slot() {
+    let max_threads = 1usize;
+    let (_home, config) = test_config_with_cli_overrides(vec![(
+        "agents.max_threads".to_string(),
+        TomlValue::Integer(max_threads as i64),
+    )])
+    .await;
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let control = manager.agent_control();
+
+    let first_agent_id = control
+        .spawn_agent(
+            config.clone(),
+            text_input("hello"),
+            /*session_source*/ None,
+        )
+        .await
+        .expect("spawn_agent should succeed");
+    let first_thread = manager
+        .get_thread(first_agent_id)
+        .await
+        .expect("first agent should exist");
+    complete_turn(&first_thread, "done").await;
+
+    let second_agent_id = control
+        .spawn_agent(
+            config.clone(),
+            text_input("occupy slot"),
+            /*session_source*/ None,
+        )
+        .await
+        .expect("spawn_agent should occupy the released slot");
+
+    let queued = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("agent path"),
+        Vec::new(),
+        "queued note".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let _ = control
+        .send_inter_agent_communication(first_agent_id, queued)
+        .await
+        .expect("queue-only communication should not consume a spawn slot");
+
+    let triggered = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("agent path"),
+        Vec::new(),
+        "new work".to_string(),
+        /*trigger_turn*/ true,
+    );
+    let err = control
+        .send_inter_agent_communication(first_agent_id, triggered)
+        .await
+        .expect_err("triggering work should reacquire a spawn slot");
+    let CodexErr::AgentLimitReached {
+        max_threads: seen_max_threads,
+    } = err
+    else {
+        panic!("expected CodexErr::AgentLimitReached");
+    };
+    assert_eq!(seen_max_threads, max_threads);
+
+    let _ = control
+        .shutdown_live_agent(first_agent_id)
+        .await
+        .expect("shutdown first agent");
+    let _ = control
+        .shutdown_live_agent(second_agent_id)
+        .await
+        .expect("shutdown second agent");
 }
 
 #[tokio::test]
